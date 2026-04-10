@@ -1,0 +1,67 @@
+"""HTML-форма: отправка ответа оператора клиенту в Telegram (секрет = BITRIX_REPLY_WEBHOOK_SECRET)."""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Form, HTTPException
+from fastapi.responses import HTMLResponse
+
+from app.core.config import settings
+from app.services.telegram import TelegramService
+
+router = APIRouter(prefix="/operator", tags=["operator"])
+
+
+def _page(title: str, body: str) -> HTMLResponse:
+    return HTMLResponse(
+        f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title}</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:2rem auto;padding:0 1rem;}} label{{display:block;margin:.75rem 0 .25rem;}} input,textarea{{width:100%;box-sizing:border-box;padding:.5rem;}} button{{margin-top:1rem;padding:.6rem 1rem;cursor:pointer;}} .hint{{color:#666;font-size:.9rem;}}</style>
+</head><body>
+<h1>{title}</h1>
+{body}
+</body></html>"""
+    )
+
+
+@router.get("/reply", response_class=HTMLResponse)
+async def operator_reply_form() -> HTMLResponse:
+    if not (settings.BITRIX_REPLY_WEBHOOK_SECRET or "").strip():
+        return _page(
+            "Ответ клиенту",
+            "<p>Секрет не задан. Добавьте в <code>.env</code> строку <code>BITRIX_REPLY_WEBHOOK_SECRET=...</code> "
+            "(любая длинная случайная строка) и перезапустите приложение.</p>"
+            "<p class='hint'>Клиент пишет в Telegram боту; <code>chat_id</code> берите из уведомления Bitrix или из логов.</p>",
+        )
+    return _page(
+        "Ответ клиенту в Telegram",
+        """<p class="hint">Сообщение уходит в тот же чат Telegram, откуда писал клиент.</p>
+<form method="post" action="/operator/reply">
+<label>Секрет (как в BITRIX_REPLY_WEBHOOK_SECRET)</label>
+<input type="password" name="secret" required autocomplete="off">
+<label>Telegram chat_id</label>
+<input type="text" name="telegram_chat_id" required placeholder="например 123456789">
+<label>Текст клиенту</label>
+<textarea name="text" rows="5" required placeholder="Ваш ответ…"></textarea>
+<button type="submit">Отправить</button>
+</form>""",
+    )
+
+
+@router.post("/reply", response_model=None)
+async def operator_reply_submit(
+    secret: str = Form(...),
+    telegram_chat_id: str = Form(...),
+    text: str = Form(...),
+) -> HTMLResponse:
+    expected = (settings.BITRIX_REPLY_WEBHOOK_SECRET or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="BITRIX_REPLY_WEBHOOK_SECRET is not configured")
+    if secret != expected:
+        raise HTTPException(status_code=403, detail="Неверный секрет")
+
+    tg = TelegramService()
+    await tg.send_message(telegram_chat_id.strip(), text.strip())
+    return _page(
+        "Готово",
+        "<p style='color:#0a0'>Сообщение отправлено в Telegram.</p>"
+        "<p><a href='/operator/reply'>Отправить ещё</a> · <a href='/docs'>API</a></p>",
+    )
