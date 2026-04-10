@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 import structlog
 from sqlalchemy import select
@@ -31,10 +32,21 @@ def _lead_id_value(lead: dict) -> int:
     return int(raw) if raw is not None else 0
 
 
-def _bitrix_im_operator_user_id() -> int | None:
+def _operator_reply_url(chat_id: str) -> str:
+    """Ссылка на форму с подставленными chat_id и secret (менеджеру остаётся ввести только текст)."""
+    base = settings.BASE_URL.rstrip("/")
+    secret = (settings.BITRIX_REPLY_WEBHOOK_SECRET or "").strip()
+    q = f"telegram_chat_id={quote(str(chat_id), safe='')}"
+    if secret:
+        q += f"&secret={quote(secret, safe='')}"
+    return f"{base}/operator/reply?{q}"
+
+
+def _im_notify_target(expert: Employee) -> int:
+    """Кому слать im: либо единый диспетчер, либо bitrix_user_id ответственного эксперта."""
     if settings.BITRIX_IM_OPERATOR_USER_ID is not None:
         return settings.BITRIX_IM_OPERATOR_USER_ID
-    return settings.PRIMARY_BITRIX_USER_ID
+    return expert.bitrix_user_id
 
 
 class OrchestratorService:
@@ -126,92 +138,101 @@ class OrchestratorService:
                 conversation.phone = phone
             await self.session.flush()
 
-        classification = await intent_svc.classify(text)
-        db_role = _INTENT_TO_DB_ROLE.get(classification, "sales")
+        async with telegram.keep_typing(chat_id):
+            classification = await intent_svc.classify(text)
+            db_role = _INTENT_TO_DB_ROLE.get(classification, "sales")
 
-        im_uid = _bitrix_im_operator_user_id()
-        if settings.BITRIX_SEND_CLIENT_MESSAGES_TO_IM and im_uid is not None:
-            base = settings.BASE_URL.rstrip("/")
-            im_body = (
-                "[B]Входящее из Telegram[/B]\n"
-                f"Классификация: {classification} → роль в БД: {db_role}\n"
-                f"Лид CRM: {lead_id}\n"
-                f"Telegram chat_id: {chat_id}\n"
-                f"Текст клиента:\n{text}\n\n"
-                f"[I]Ответить клиенту:[/I] страница {base}/operator/reply "
-                f"или POST {base}/webhook/bitrix/reply (см. BITRIX_REPLY_WEBHOOK_SECRET)."
-            )
-            try:
-                await bitrix.send_operator_alert(im_uid, im_body)
-            except BitrixAPIError as exc:
-                log.warning(
-                    "bitrix_operator_alert_failed",
-                    error=str(exc),
-                    hint="Проверьте права вебхука на «Чат и уведомления (im)»",
+            if classification in ("TECH", "PRICE"):
+                kb_role = _INTENT_TO_DB_ROLE[classification]
+                answer_data = await knowledge_svc.search(text, kb_role)
+                if answer_data is not None:
+                    await telegram.send_message(chat_id, answer_data["answer"])
+                    try:
+                        await bitrix.add_comment_to_lead(
+                            lead_id, f"Бот: {answer_data['answer']}"
+                        )
+                    except BitrixAPIError as exc:
+                        log.warning("bitrix_comment_failed", error=str(exc))
+                    # Уведомление в im не шлём: клиент уже получил ответ в Telegram.
+                    await self.session.commit()
+                    return
+
+            expert = await employee_svc.get_available_expert(db_role)
+            if expert is None:
+                expert = await employee_svc.get_available_expert("sales")
+            if expert is None:
+                await telegram.send_message(
+                    chat_id,
+                    "Сейчас нет доступных специалистов. Попробуйте позже или напишите ещё раз.",
                 )
-
-        if classification in ("TECH", "PRICE"):
-            kb_role = _INTENT_TO_DB_ROLE[classification]
-            answer_data = await knowledge_svc.search(text, kb_role)
-            if answer_data is not None:
-                await telegram.send_message(chat_id, answer_data["answer"])
-                try:
-                    await bitrix.add_comment_to_lead(
-                        lead_id, f"Бот: {answer_data['answer']}"
-                    )
-                except BitrixAPIError as exc:
-                    log.warning("bitrix_comment_failed", error=str(exc))
                 await self.session.commit()
                 return
 
-        expert = await employee_svc.get_available_expert(db_role)
-        if expert is None:
-            expert = await employee_svc.get_available_expert("sales")
-        if expert is None:
+            if settings.PRIMARY_BITRIX_USER_ID is not None:
+                apply_primary = (
+                    not settings.BITRIX_PRIMARY_USER_ID_SALES_ONLY or db_role == "sales"
+                )
+                if apply_primary:
+                    primary_row = await self.session.execute(
+                        select(Employee).where(
+                            Employee.bitrix_user_id == settings.PRIMARY_BITRIX_USER_ID
+                        )
+                    )
+                    primary_expert = primary_row.scalar_one_or_none()
+                    if primary_expert is not None:
+                        expert = primary_expert
+                        log.info(
+                            "orchestrator_primary_bitrix_assignee",
+                            bitrix_user_id=settings.PRIMARY_BITRIX_USER_ID,
+                        )
+
+            reply_url = _operator_reply_url(chat_id)
+            if settings.BITRIX_SEND_CLIENT_MESSAGES_TO_IM:
+                im_body = (
+                    "[B]Входящее из Telegram[/B]\n"
+                    f"Классификация: {classification} → роль в БД: {db_role}\n"
+                    f"Ответственный (задача): {expert.name} ({expert.role}), Bitrix USER_ID {expert.bitrix_user_id}\n"
+                    f"Лид CRM: {lead_id}\n"
+                    f"Telegram chat_id: {chat_id}\n"
+                    f"Текст клиента:\n{text}\n\n"
+                    f"[URL={reply_url}]Ответить клиенту (форма)[/URL]"
+                )
+                try:
+                    await bitrix.send_operator_alert(
+                        _im_notify_target(expert), im_body
+                    )
+                except BitrixAPIError as exc:
+                    log.warning(
+                        "bitrix_operator_alert_failed",
+                        error=str(exc),
+                        hint="Проверьте права вебхука на «Чат и уведомления (im)»",
+                    )
+
+            if settings.BITRIX_CREATE_TASK_ON_ROUTING:
+                try:
+                    await bitrix.create_task(
+                        expert.bitrix_user_id,
+                        f"Ответ клиенту {lead_id}",
+                        f"Клиент спрашивает: {text}\nОтветить в Telegram чат {chat_id}",
+                        lead_id,
+                    )
+                except BitrixAPIError as exc:
+                    # Не роняем весь сценарий: клиент уже увидит подтверждение; im ушёл (если не упал).
+                    log.warning(
+                        "bitrix_create_task_failed",
+                        error=str(exc),
+                        lead_id=lead_id,
+                        responsible_bitrix_id=expert.bitrix_user_id,
+                        hint="Проверьте права вебхука на tasks и поля CRM у задачи",
+                    )
+
+            if conversation is not None:
+                conversation.assigned_employee_id = expert.id
+                conversation.last_message_at = datetime.now(UTC)
+                await self.session.flush()
+
             await telegram.send_message(
                 chat_id,
-                "Произошла ошибка. Пожалуйста, попробуйте позже.",
+                f"Ваш запрос передан {expert.name} ({expert.role}). Ожидайте ответа.",
             )
             await self.session.commit()
-            return
-
-        if settings.PRIMARY_BITRIX_USER_ID is not None:
-            apply_primary = (
-                not settings.BITRIX_PRIMARY_USER_ID_SALES_ONLY or db_role == "sales"
-            )
-            if apply_primary:
-                primary_row = await self.session.execute(
-                    select(Employee).where(
-                        Employee.bitrix_user_id == settings.PRIMARY_BITRIX_USER_ID
-                    )
-                )
-                primary_expert = primary_row.scalar_one_or_none()
-                if primary_expert is not None:
-                    expert = primary_expert
-                    log.info(
-                        "orchestrator_primary_bitrix_assignee",
-                        bitrix_user_id=settings.PRIMARY_BITRIX_USER_ID,
-                    )
-
-        if settings.BITRIX_CREATE_TASK_ON_ROUTING:
-            try:
-                await bitrix.create_task(
-                    expert.bitrix_user_id,
-                    f"Ответ клиенту {lead_id}",
-                    f"Клиент спрашивает: {text}\nОтветить в Telegram чат {chat_id}",
-                    lead_id,
-                )
-            except BitrixAPIError as exc:
-                log.exception("bitrix_create_task_failed", error=str(exc))
-                raise
-
-        if conversation is not None:
-            conversation.assigned_employee_id = expert.id
-            conversation.last_message_at = datetime.now(UTC)
-            await self.session.flush()
-
-        await telegram.send_message(
-            chat_id,
-            f"Ваш запрос передан {expert.name} ({expert.role}). Ожидайте ответа.",
-        )
-        await self.session.commit()

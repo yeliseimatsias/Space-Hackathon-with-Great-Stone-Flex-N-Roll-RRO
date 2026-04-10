@@ -18,9 +18,13 @@
 | `BITRIX_WEBHOOK_URL` | Входящий вебхук Bitrix24 (CRM, задачи, **im**) |
 | `DATABASE_URL` | AsyncPG-строка; имя БД в Docker: **`flexnroll`** |
 | `LLM_API_KEY` | Ключ Google AI Studio (Gemini) |
-| `BITRIX_REPLY_WEBHOOK_SECRET` | Опционально: секрет для `/operator/reply` и `POST /webhook/bitrix/reply` |
+| `LLM_MODEL` | Идентификатор модели (например `gemini-2.5-flash`). Модели **Gemini 1.5** сняты с API и дают 404 — классификация тогда всегда падает в SALES. |
+| `BITRIX_REPLY_WEBHOOK_SECRET` | Секрет для формы/API ответа клиенту |
+| `PRIMARY_BITRIX_USER_ID` | Опционально: все **задачи** на этот USER_ID Bitrix |
+| `BITRIX_PRIMARY_USER_ID_SALES_ONLY` | По умолчанию **true**: подмена эксперта только для роли **sales**; `false` — все задачи на PRIMARY (режим «один менеджер на всё») |
+| `BITRIX_IM_OPERATOR_USER_ID` | Если задан — все **уведомления im** только ему; если не задан — уведомление идёт **ответственному по роли** (тому же, кому задача) |
 
-**Без Bitrix OAuth:** достаточно вебхука. Оператор видит в уведомлении `telegram_chat_id` и отвечает через `GET /operator/reply` или POST.
+В уведомлении Bitrix есть ссылка **`/operator/reply?telegram_chat_id=…&secret=…`** — открывается короткая форма: менеджер вводит только текст сообщения.
 
 ## Быстрый старт (Docker: приложение + БД)
 
@@ -55,6 +59,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 |--------|--------|------------|
 | **`setup.ps1`** | Один раз (или после клона) | Если нет `.env` — копирует из `.env.example`; `pip install -r requirements.txt`; поднимает контейнер **`db`** из `docker/docker-compose.yml`; ждёт Postgres; `alembic upgrade head`. |
 | **`dev.ps1`** | Каждый раз при разработке | `uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload` |
+| **`verify_llm.py`** | Проверка Gemini | См. раздел «Проверка LLM» ниже. |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
@@ -62,6 +67,11 @@ powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
 ```
 
 На Linux/macOS те же шаги — вручную командами из раздела «Локально» выше; скрипты не обязательны.
+
+### Проверка LLM (Gemini)
+
+- **Скрипт** (из корня репозитория, подхватывает `.env`): `python scripts/verify_llm.py` — печатает `model`, `intent`, `raw_text` (ожидается пример про визитки → **PRICE**). Свой текст: `python scripts/verify_llm.py "где мой заказ?"`.
+- **HTTP** (нужен **`BITRIX_REPLY_WEBHOOK_SECRET`** в `.env`): `GET /health/llm?secret=...` — то же в JSON; опционально `&message=...` для своего запроса.
 
 ## Сценарий демо (MVP)
 

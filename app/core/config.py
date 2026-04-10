@@ -11,13 +11,14 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL_NAME: str = "paraphrase-multilingual-MiniLM-L12-v2"
     KNOWLEDGE_THRESHOLD: float = 0.75
     LLM_API_KEY: str
-    LLM_MODEL: str = "models/gemini-1.5-flash"
+    # Gemini 1.5 сняты с API (404). Актуальные: gemini-2.5-flash, gemini-2.5-flash-lite.
+    LLM_MODEL: str = "gemini-2.5-flash"
     LOG_LEVEL: str = "INFO"
-    # Все задачи Bitrix (tasks.task.add) на этого USER_ID, если задан.
+    # Все задачи на этого USER_ID Bitrix, если задан (см. BITRIX_PRIMARY_USER_ID_SALES_ONLY).
     PRIMARY_BITRIX_USER_ID: int | None = None
-    # Если true и PRIMARY_BITRIX_USER_ID задан — подмена только для роли sales.
-    BITRIX_PRIMARY_USER_ID_SALES_ONLY: bool = False
-    # Кому слать уведомления о входящем (im). Если None — PRIMARY_BITRIX_USER_ID.
+    # Если True — PRIMARY_BITRIX_USER_ID подменяет эксперта только для sales; иначе на все роли.
+    BITRIX_PRIMARY_USER_ID_SALES_ONLY: bool = True
+    # Если задан — все im-уведомления только ему (режим «один диспетчер»). Если None — уведомление тому, кому ушла задача.
     BITRIX_IM_OPERATOR_USER_ID: int | None = None
     BITRIX_SEND_CLIENT_MESSAGES_TO_IM: bool = True
     BITRIX_CREATE_TASK_ON_ROUTING: bool = True
