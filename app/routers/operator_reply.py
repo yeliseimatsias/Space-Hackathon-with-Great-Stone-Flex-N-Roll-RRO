@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import html
+import structlog
 from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import HTMLResponse
+from telegram.error import TelegramError
 
 from app.core.config import settings
 from app.services.telegram import TelegramService
+
+log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/operator", tags=["operator"])
 
@@ -33,12 +38,12 @@ async def operator_reply_form() -> HTMLResponse:
         )
     return _page(
         "Ответ клиенту в Telegram",
-        """<p class="hint">Сообщение уходит в тот же чат Telegram, откуда писал клиент.</p>
-<form method="post" action="/operator/reply">
+        """<p class="hint">Сообщение уходит в тот же чат Telegram, откуда писал клиент. Откройте эту страницу по тому же адресу, что и <code>BASE_URL</code> в .env (форма отправляется на текущий URL).</p>
+<form method="post" accept-charset="utf-8">
 <label>Секрет (как в BITRIX_REPLY_WEBHOOK_SECRET)</label>
 <input type="password" name="secret" required autocomplete="off">
 <label>Telegram chat_id</label>
-<input type="text" name="telegram_chat_id" required placeholder="например 123456789">
+<input type="text" name="telegram_chat_id" required placeholder="например 123456789" inputmode="numeric">
 <label>Текст клиенту</label>
 <textarea name="text" rows="5" required placeholder="Ваш ответ…"></textarea>
 <button type="submit">Отправить</button>
@@ -55,11 +60,36 @@ async def operator_reply_submit(
     expected = (settings.BITRIX_REPLY_WEBHOOK_SECRET or "").strip()
     if not expected:
         raise HTTPException(status_code=503, detail="BITRIX_REPLY_WEBHOOK_SECRET is not configured")
-    if secret != expected:
-        raise HTTPException(status_code=403, detail="Неверный секрет")
+    if secret.strip() != expected:
+        log.warning("operator_reply_bad_secret")
+        return _page(
+            "Неверный секрет",
+            "<p style='color:#c00'>Секрет не совпадает с <code>BITRIX_REPLY_WEBHOOK_SECRET</code> в .env (проверьте пробелы и кавычки).</p>"
+            "<p><a href='/operator/reply'>Назад</a></p>",
+        )
+
+    cid = telegram_chat_id.strip()
+    body = text.strip()
+    if not cid or not body:
+        return _page(
+            "Пустые поля",
+            "<p>Укажите chat_id и текст.</p><p><a href='/operator/reply'>Назад</a></p>",
+        )
 
     tg = TelegramService()
-    await tg.send_message(telegram_chat_id.strip(), text.strip())
+    try:
+        await tg.send_message(cid, body)
+    except TelegramError as exc:
+        log.warning("operator_reply_telegram_failed", error=str(exc), chat_id=cid)
+        err = html.escape(str(exc))
+        return _page(
+            "Telegram не принял сообщение",
+            f"<p style='color:#c00'>Ошибка Telegram API:</p><pre style='white-space:pre-wrap;word-break:break-all;'>{err}</pre>"
+            "<p class='hint'>Частые причины: неверный chat_id, клиент не писал боту, бот удалён из чата, или токен бота не тот.</p>"
+            "<p><a href='/operator/reply'>Назад</a></p>",
+        )
+
+    log.info("operator_reply_sent", chat_id=cid)
     return _page(
         "Готово",
         "<p style='color:#0a0'>Сообщение отправлено в Telegram.</p>"
